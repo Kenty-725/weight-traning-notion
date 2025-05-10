@@ -4,42 +4,37 @@ require 'uri'
 require 'logger'
 require 'aws-sdk-ssm'
 
-def get_parameter(name, logger)
+def get_parameter(name)
   ssm = Aws::SSM::Client.new(region: 'ap-northeast-1')
   response = ssm.get_parameter(name: name, with_decryption: true)
-  value = response.parameter.value
-  logger.debug("#{name} value encoding: #{value.encoding}")
-  logger.debug("#{name} value preview: #{value[0..20].inspect}")
-  value
+  response.parameter.value
+end
+
+# N行目をパースするメソッド
+def parse_training_line(line)
+  # 例: "ベンチプレス 50Kg 10回"（全角スペースも対応）
+  if line =~ /^(.+?)[\s　]+(\d+)[kK][gG][\s　]+(\d+)回$/
+    menu = $1.strip
+    weight = $2.to_i
+    reps = $3.to_i
+    [menu, weight, reps]
+  else
+    [nil, nil, nil]
+  end
 end
 
 def lambda_handler(event:, context:)
   logger = Logger.new(STDOUT)
   logger.level = Logger::DEBUG
-  logger.debug("Lambda started.")
 
   begin
-    logger.debug("event['body'] encoding: #{event['body']&.encoding}")
-    logger.debug("event['body'] preview: #{event['body']&.byteslice(0, 40).inspect}")
     body = JSON.parse(event['body'])
-    logger.debug("Parsed body: #{body.inspect}")
-
     user_message = body.dig("events", 0, "message", "text") || "No message"
-    logger.debug("user_message raw: #{user_message.inspect}, encoding: #{user_message.encoding}")
 
-    # ここで明示的にUTF-8変換（エラーが出てもログ）
-    begin
-      user_message = user_message.to_s.encode("UTF-8")
-      logger.debug("user_message after encode: #{user_message.inspect}, encoding: #{user_message.encoding}")
-    rescue => e
-      logger.error("user_message encode error: #{e.message}")
-    end
+    logger.debug("Received user message: #{user_message}")
 
-    notion_api_key = get_parameter('/NOTION_API_KEY', logger)
-    notion_database_id = get_parameter('/NOTION_DATABASE_ID', logger)
-
-    logger.debug("Notion API Key: #{notion_api_key.nil? ? 'nil' : 'obtained'}")
-    logger.debug("Notion Database ID: #{notion_database_id.nil? ? 'nil' : notion_database_id}")
+    notion_api_key = get_parameter('/NOTION_API_KEY')
+    notion_database_id = get_parameter('/NOTION_DATABASE_ID')
 
     if notion_api_key.nil? || notion_database_id.nil?
       logger.warn("Missing environment variables for Notion API.")
@@ -52,81 +47,80 @@ def lambda_handler(event:, context:)
       }
     end
 
-    uri = URI.parse("https://api.notion.com/v1/pages")
+    # === ここから改修 ===
+    lines = user_message.strip.split(/[\r\n]+/)
+    training_type = lines[0]&.strip || ""
 
-    # 💡 Title(プロパティ名) 問題の検証ログ
-    title_property = "Title"  # ←あなたのDBのプロパティ名に直してください
-    logger.debug("Using Notion property: '#{title_property}'")
+    # 2〜5行目をパース（最大4種目分）
+    menus_weights_reps = (1..4).map { |i| parse_training_line(lines[i] || "") }
+    # menus_weights_reps => [[menu1, weight1, reps1], [menu2, weight2, reps2], ...]
 
-    payload = {
-      parent: { database_id: notion_database_id },
-      properties: {
-        title_property => {
-          title: [ { text: { content: user_message } } ]
-        }
+    today_str = Time.now.strftime('%Y-%m-%d') # ISO8601形式(YYYY-MM-DD)
+
+    # Notion API リクエストの準備
+    properties = {
+      "TrainingType" => {
+        "title" => [
+          { "text" => { "content" => training_type } }
+        ]
+      },
+      "WorkoutDate" => {
+        "date" => { "start" => today_str }
       }
     }
 
-    logger.debug("Payload for Notion: #{payload.inspect}")
+    menus_weights_reps.each_with_index do |(menu, weight, reps), idx|
+      n = idx + 1
+      properties["TrainingMenu#{n}"] = {
+        "rich_text" => [
+          { "text" => { "content" => menu.to_s } }
+        ]
+      }
+      properties["Weight#{n}"] = {
+        "number" => weight.nil? || weight == 0 ? nil : weight
+      }
+      properties["Reps#{n}"] = {
+        "number" => reps.nil? || reps == 0 ? nil : reps
+      }
+    end
 
+    payload = {
+      parent: { database_id: notion_database_id },
+      properties: properties
+    }
+    # === ここまで改修 ===
+
+    uri = URI.parse("https://api.notion.com/v1/pages")
     headers = {
       "Authorization" => "Bearer #{notion_api_key}",
-      "Content-Type" => "application/json; charset=utf-8",
+      "Content-Type" => "application/json",
       "Notion-Version" => "2022-06-28"
     }
 
     http = Net::HTTP.new(uri.host, uri.port)
     http.use_ssl = true
     request = Net::HTTP::Post.new(uri.path, headers)
-    
-    begin
-      request.body = payload.to_json(:ascii_only => false)
-      logger.debug("Request body encoding: #{request.body.encoding}")
-    rescue => e
-      logger.error("payload.to_json error: #{e.message}")
-      raise
-    end
+    request.body = payload.to_json
 
-    logger.info("==== Sending request to Notion")
-    begin
-      response = http.request(request)
-      logger.info("==== Notion response status: #{response.code}")
-
-      # --- ここからが修正point！ ---
-      # 外部から来たresponse.bodyをUTF-8エンコードして安全に
-      safe_resp_preview = response.body && response.body.byteslice(0,200)
-      begin
-        safe_resp_preview = safe_resp_preview.to_s.encode('UTF-8', invalid: :replace, undef: :replace)
-      rescue => e
-        safe_resp_preview = safe_resp_preview.to_s.inspect
-      end
-      logger.debug("==== Notion response body (first 200 bytes): #{safe_resp_preview}")
-      # --- ここまで修正point ---
-
-    rescue => e
-      logger.error("HTTP request error: #{e.message}")
-      raise
-    end
+    response = http.request(request)
 
     if response.is_a?(Net::HTTPSuccess)
-      # response.bodyをログに出す時もエンコード
       safe_body = response.body.to_s.encode('UTF-8', invalid: :replace, undef: :replace)
       logger.info("Successfully sent to Notion: #{safe_body}")
       {
         statusCode: 200,
         body: JSON.generate({
           message: "✅ Sent to Notion",
-          notion_response: safe_body[0..200]
+          notion_response: response.body[0..200]
         })
       }
     else
-      safe_body = response.body.to_s.encode('UTF-8', invalid: :replace, undef: :replace)
-      logger.error("Failed to send to Notion: #{safe_body}")
+      logger.error("Failed to send to Notion: #{response.body}")
       {
         statusCode: response.code.to_i,
         body: JSON.generate({
           message: "❌ Failed to send to Notion",
-          notion_response: safe_body
+          notion_response: response.body
         })
       }
     end
@@ -148,12 +142,12 @@ def lambda_handler(event:, context:)
       })
     }
   rescue StandardError => e
-    logger.error("Unexpected error: #{e.class} - #{e.message}\n#{e.backtrace.join("\n")}")
+    logger.error("Unexpected error: #{e.message}")
     {
       statusCode: 500,
       body: JSON.generate({
         message: "Internal Server Error",
-        error: "#{e.class} - #{e.message}"
+        error: e.message
       })
     }
   end
